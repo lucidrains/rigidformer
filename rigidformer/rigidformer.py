@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from torch import nn, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, Parameter
 
@@ -18,6 +19,32 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+# film
+
+class FiLM(Module):
+    def __init__(
+        self,
+        dim,
+        dim_cond
+    ):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, elementwise_affine = False)
+
+        self.to_gamma_beta = Linear(dim_cond, dim * 2, bias = False)
+        nn.init.zeros_(self.to_gamma_beta.weight)
+
+    def forward(
+        self,
+        tokens,
+        cond
+    ):
+        normed = self.norm(tokens)
+
+        gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
+
+        scaled = einx.add('b n d, b d', normed, gamma + 1.)
+        return einx.add('b n d, b d', scaled, beta)
 
 # classes
 
@@ -109,6 +136,7 @@ class Rigidformer(Module):
         layers = ModuleList([])
 
         for _ in range(depth):
+
             attn = Attention(
                 dim = dim,
                 dim_head = dim_head,
@@ -120,23 +148,38 @@ class Rigidformer(Module):
                 expansion_factor = ff_expansion
             )
 
-            layers.append(ModuleList([attn, ff]))
+            attn_film = FiLM(dim, 2)
+            ff_film = FiLM(dim, 2)
+
+            layers.append(ModuleList([attn_film, attn, ff_film, ff]))
 
         self.layers = layers
         self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
 
     def forward(
         self,
-        tokens
+        tokens, # (b n d)
+        times   # (b)
     ):
         batch = tokens.shape[0]
+
+        # time conditioning
+
+        times = times.float()
+        time_cond = stack((times, times.pow(2)), dim = -1) # t and t^2
+
+        # register tokens
 
         registers = repeat(self.register_tokens, 'n d -> b n d', b = batch)
 
         tokens, inverse_pack_registers = pack_with_inverse((registers, tokens), 'b * d')
 
-        for attn, ff in self.layers:
-            tokens = attn(tokens) + tokens
+        for attn_film, attn, ff_film, ff in self.layers:
+
+            filmed = attn_film(tokens, time_cond)
+            tokens = attn(filmed) + tokens
+
+            filmed = ff_film(tokens, time_cond)
             tokens = ff(tokens) + tokens
 
         _, tokens = inverse_pack_registers(tokens)

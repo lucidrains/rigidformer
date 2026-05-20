@@ -6,8 +6,10 @@ def test_rigidformer():
 
     import torch
 
-    x = torch.randn(1, 1024, 512)
+    x = torch.randn(2, 1024, 512)
+    t = torch.randn(2)
+
     rigidformer = Rigidformer(512)
 
-    out = rigidformer(x)
+    out = rigidformer(x, t)
     assert x.shape == out.shape
