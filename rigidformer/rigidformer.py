@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import torch
-from torch.nn import Module, ModuleList, Linear
+import torch.nn.functional as F
+from torch.nn import Module, ModuleList, Linear, Parameter
 
 import einx
-from einops import einsum
+from einops import einsum, repeat
 from einops.layers.torch import Rearrange
+from torch_einops_utils import pack_with_inverse
 
 # helpers
 
@@ -49,7 +51,7 @@ class Attention(Module):
             *self.to_keys_values(context).chunk(2, dim = -1)
         )
 
-        queries, gates, keys, values = (self.split_heads(t) for t in (queries, gates, keys, values))
+        queries, keys, values = (self.split_heads(t) for t in (queries, keys, values))
 
         queries = queries * self.scale
 
@@ -59,20 +61,82 @@ class Attention(Module):
 
         out = einsum(attn, values, 'b h i j, b h j d -> b h i d')
 
-        out = out * gates.sigmoid()
-
         out = self.merge_heads(out)
+
+        out = out * gates.sigmoid()
         return self.to_out(out)
+
+class SwiGluFeedforward(Module):
+    # Shazeer et al
+
+    def __init__(
+        self,
+        dim,
+        expansion_factor = 4.
+    ):
+        super().__init__()
+        dim_inner = int(dim * expansion_factor * 2 / 3)
+
+        self.proj_in = Linear(dim, dim_inner * 2)
+        self.proj_out = Linear(dim_inner, dim)
+
+    def forward(
+        self,
+        tokens
+    ):
+        hiddens, gates = self.proj_in(tokens).chunk(2, dim = -1)
+
+        hiddens = hiddens * F.gelu(gates)
+
+        return self.proj_out(hiddens)
 
 # main class
 
 class Rigidformer(Module):
     def __init__(
-        self
+        self,
+        dim,
+        depth = 6,
+        dim_head = 64,
+        heads = 8,
+        ff_expansion = 4.,
+        num_register_tokens = 16
     ):
         super().__init__()
 
+        layers = ModuleList([])
+
+        for _ in range(depth):
+            attn = Attention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads
+            )
+
+            ff = SwiGluFeedforward(
+                dim = dim,
+                expansion_factor = ff_expansion
+            )
+
+            layers.append(ModuleList([attn, ff]))
+
+        self.layers = layers
+        self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
+
     def forward(
-        self
+        self,
+        tokens
     ):
-        raise NotImplementedError
+        batch = tokens.shape[0]
+
+        registers = repeat(self.register_tokens, 'n d -> b n d', b = batch)
+
+        tokens, inverse_pack_registers = pack_with_inverse((registers, tokens), 'b * d')
+
+        for attn, ff in self.layers:
+            tokens = attn(tokens) + tokens
+            tokens = ff(tokens) + tokens
+
+        _, tokens = inverse_pack_registers(tokens)
+
+        return tokens
