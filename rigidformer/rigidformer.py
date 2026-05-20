@@ -9,6 +9,8 @@ from einops import einsum, repeat
 from einops.layers.torch import Rearrange
 from torch_einops_utils import pack_with_inverse
 
+import roma
+
 # helpers
 
 def exists(v):
