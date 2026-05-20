@@ -2,7 +2,7 @@
 
 ## Rigidformer (wip)
 
-Implementation of [RigidFormer](https://arxiv.org/abs/2605.09196), Learning Rigid Dynamics using Transformers
+Implementation of [RigidFormer](https://arxiv.org/abs/2605.09196), Learning Rigid Dynamics using Transformers, out of MIT and Meta
 
 ## Citations
 
