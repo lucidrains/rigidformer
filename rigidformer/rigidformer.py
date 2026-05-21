@@ -1,16 +1,23 @@
 from __future__ import annotations
+from collections import namedtuple
 
 import torch
-from torch import nn, cat, stack
 import torch.nn.functional as F
+from torch import nn, cat, stack, tensor
 from torch.nn import Module, ModuleList, Linear, Parameter
 
 import einx
-from einops import einsum, repeat
+from einops import einsum, rearrange, repeat, pack
 from einops.layers.torch import Rearrange
 from torch_einops_utils import pack_with_inverse
 
 import roma
+
+# constants
+
+Predictions = namedtuple('Predictions', ('acceleration', 'position'))
+
+Losses = namedtuple('Losses', ('acceleration', 'position'))
 
 # helpers
 
@@ -125,17 +132,23 @@ class Rigidformer(Module):
     def __init__(
         self,
         dim,
-        depth = 6,
-        dim_head = 64,
-        heads = 8,
-        ff_expansion = 4.,
-        num_register_tokens = 16
+        dim_head = 128,
+        heads = 6,
+        ff_expansion = 2.5,
+        num_register_tokens = 16,
+        object_self_attn_depth = 4,
+        anchor_cross_attn_depth = 4,
+        object_hidden_layers: tuple[int, ...] = (0, 1, 2, 4),  # the hidden object layer outputs that the anchor decoder cross attends to
+        pos_loss_weight = 10.,
+        acc_loss_weight = 1.,
     ):
         super().__init__()
 
+        # object self attention related
+
         layers = ModuleList([])
 
-        for _ in range(depth):
+        for _ in range(object_self_attn_depth):
 
             attn = Attention(
                 dim = dim,
@@ -153,35 +166,155 @@ class Rigidformer(Module):
 
             layers.append(ModuleList([attn_film, attn, ff_film, ff]))
 
-        self.layers = layers
+        self.self_attn_layers = layers
         self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
+
+        # anchor cross attention related
+
+        assert object_self_attn_depth in object_hidden_layers, '`object_hidden_layers` should attend to the output of the object transformer ({object_self_attn_depth})'
+        assert all([0 <= l <= object_self_attn_depth for l in object_hidden_layers])
+        assert len(object_hidden_layers) == anchor_cross_attn_depth, 'length of `object_hidden_layers` must be equal to the depth of the anchor cross attention transformer'
+
+        layers = ModuleList([])
+
+        for _ in range(anchor_cross_attn_depth):
+
+            attn = Attention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads
+            )
+
+            ff = SwiGluFeedforward(
+                dim = dim,
+                expansion_factor = ff_expansion
+            )
+
+            attn_film = FiLM(dim, 2)
+            ff_film = FiLM(dim, 2)
+
+            layers.append(ModuleList([attn_film, attn, ff_film, ff]))
+
+        self.cross_attn_layers = layers
+
+        self.object_hidden_layers = object_hidden_layers
+
+        self.to_acc_pred = nn.Sequential(
+            nn.RMSNorm(dim),
+            Linear(dim, 3, bias = False)
+        )
+
+        # loss related
+
+        self.loss_fn = nn.SmoothL1Loss()
+
+        self.pos_loss_weight = pos_loss_weight
+        self.acc_loss_weight = acc_loss_weight
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
 
     def forward(
         self,
-        tokens, # (b n d)
-        times   # (b)
+        object_tokens,           # (b no d)
+        anchor_tokens,           # (b na d)
+        *,
+        delta_times,             # (b)
+        anchor_pos = None,       # (b na 3)
+        anchor_pos_prev = None,  # (b na 3)
+        anchor_pos_next = None   # (b na 3)
     ):
-        batch = tokens.shape[0]
+        batch = object_tokens.shape[0]
 
         # time conditioning
 
-        times = times.float()
-        time_cond = stack((times, times.pow(2)), dim = -1) # t and t^2
+        delta_times = delta_times.float()
+        delta_times_squared = delta_times.pow(2)
+        time_cond = stack((delta_times, delta_times_squared), dim = -1) # t and t^2
 
         # register tokens
 
-        registers = repeat(self.register_tokens, 'n d -> b n d', b = batch)
+        registers = repeat(self.register_tokens, 'no d -> b no d', b = batch)
 
-        tokens, inverse_pack_registers = pack_with_inverse((registers, tokens), 'b * d')
+        object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b * d')
 
-        for attn_film, attn, ff_film, ff in self.layers:
+        # object self attention
 
-            filmed = attn_film(tokens, time_cond)
-            tokens = attn(filmed) + tokens
+        object_hiddens = [object_tokens]
 
-            filmed = ff_film(tokens, time_cond)
-            tokens = ff(tokens) + tokens
+        for attn_film, attn, ff_film, ff in self.self_attn_layers:
 
-        _, tokens = inverse_pack_registers(tokens)
+            filmed = attn_film(object_tokens, time_cond)
+            object_tokens = attn(filmed) + object_tokens
 
-        return tokens
+            filmed = ff_film(object_tokens, time_cond)
+            object_tokens = ff(object_tokens) + object_tokens
+
+            # remove the register tokens from the ensuing cross attention
+
+            _, layer_hiddens = inverse_pack_registers(object_tokens)
+            object_hiddens.append(layer_hiddens)
+
+        # anchor cross attention
+
+        object_contexts = [object_hiddens[layer] for layer in self.object_hidden_layers] # gather all the object self attention hidden layers for cross attending
+
+        for (attn_film, attn, ff_film, ff), object_context in zip(self.cross_attn_layers, object_contexts):
+            filmed = attn_film(anchor_tokens, time_cond)
+            anchor_tokens = attn(filmed, context = object_context) + anchor_tokens
+
+            filmed = ff_film(anchor_tokens, time_cond)
+            anchor_tokens = ff(filmed) + anchor_tokens
+
+        pred_acc = self.to_acc_pred(anchor_tokens)
+
+        assert exists(anchor_pos) == exists(anchor_pos_prev)
+
+        pred = pred_acc
+
+        # calculate predicted next position if prerequisites are given (current and past position)
+
+        if exists(anchor_pos): # verlet - til
+            pred_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared)
+            pred = Predictions(pred_acc, pred_pos_next)
+
+        # early return prediction if ground truth not passed in
+
+        return_loss = exists(anchor_pos) and exists(anchor_pos_next)
+
+        if not return_loss:
+            return pred
+
+        delta_times_squared = rearrange(delta_times_squared, 'b -> b 1 1')
+
+        # calculate loss with roma + kabsch
+
+        anchor_acc = (anchor_pos_next - 2 * anchor_pos + anchor_pos_prev) / delta_times_squared
+
+        # handle acceleration
+
+        R = roma.rigid_vectors_registration(pred_acc, anchor_acc)
+
+        pred_acc_rigid = einsum(pred_acc, R, 'b na c1, b c2 c1 -> b na c2')
+
+        # handle points
+
+        R, T = roma.rigid_points_registration(pred_pos_next, anchor_pos_next)
+
+        pred_pos_next_rotated = einsum(pred_pos_next, R, 'b na c1, b c2 c1 -> b na c2')
+        pred_pos_next_translated = einx.add('b na c, b c', pred_pos_next_rotated, T)
+
+        pred_pos_next_rigid = pred_pos_next_translated
+
+        # losses, using smooth l1 loss, which they had a lot of success with it appears
+
+        loss_fn = self.loss_fn
+
+        acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
+        pos_loss = loss_fn(pred_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
+
+        total_loss = (
+            acc_loss * self.acc_loss_weight +
+            pos_loss * self.pos_loss_weight
+        )
+
+        return total_loss, Losses(acc_loss, pos_loss)
