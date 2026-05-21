@@ -9,7 +9,8 @@ from torch.nn import Module, ModuleList, Linear, Parameter
 import einx
 from einops import einsum, rearrange, repeat, pack
 from einops.layers.torch import Rearrange
-from torch_einops_utils import pack_with_inverse
+
+from torch_einops_utils import pack_with_inverse, maybe
 
 import roma
 
@@ -195,7 +196,8 @@ class Rigidformer(Module):
 
         layers = ModuleList([])
 
-        for _ in range(object_self_attn_depth):
+        for i in range(object_self_attn_depth):
+            is_last = i == (object_self_attn_depth - 1)
 
             attn = Attention(
                 dim = dim,
@@ -211,7 +213,7 @@ class Rigidformer(Module):
             attn_film = FiLM(dim, 2)
             ff_film = FiLM(dim, 2)
 
-            attn_residual = AttentionResidualPool(dim)
+            attn_residual = AttentionResidualPool(dim) if not is_last else None
 
             layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
 
@@ -302,7 +304,7 @@ class Rigidformer(Module):
 
             object_hiddens.append(object_tokens)
 
-            object_tokens = attn_residual(object_hiddens)
+            object_tokens = maybe(attn_residual)(object_hiddens)
 
         # anchor cross attention
 
