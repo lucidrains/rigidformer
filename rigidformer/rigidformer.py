@@ -1,4 +1,5 @@
 from __future__ import annotations
+from math import log
 from collections import namedtuple
 
 import torch
@@ -32,6 +33,9 @@ def divisible_by(num, den):
     return (num % den) == 0
 
 # tensor helpers
+
+def l1norm(t):
+    return F.normalize(t, dim = -1, p = 1)
 
 def mean_and_expand_back(t, dim):
     shape = t.shape
@@ -70,6 +74,53 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(pos, t):
     return t * pos.cos() + rotate_half(t) * pos.sin()
+
+# anchor vertex pooling
+
+# basically a weighted aggregation with the l1norm on the negative exponentiated euclidean distance from anchor to object positions
+# the learned sigma seems like a weak point in the scheme. seems like it should be scene dependent?
+
+class AnchorVertexPool(Module):
+    def __init__(
+        self,
+        init_sigma = 1.,
+        learned_sigma = False
+    ):
+        super().__init__()
+
+        log_sigma = log(init_sigma)
+
+        self.log_sigma = nn.Parameter(tensor(log_sigma), requires_grad = learned_sigma)
+
+    @property
+    def sigma(self):
+        return self.log_sigma.exp()
+
+    def forward(
+        self,
+        object_tokens,  # (b no n d)
+        object_pos,     # (b no n p)
+        anchor_indices  # (b no na)
+    ):
+
+        anchor_indices = repeat(anchor_indices, '... -> ... p', p = 3)
+        anchor_pos = object_pos.gather(-2, anchor_indices)
+
+        object_pos, inverse_pack = pack_with_inverse(object_pos, '* n p')
+        packed_anchor_pos, _ = pack_with_inverse(anchor_pos, '* n p')
+
+        distance = torch.cdist(packed_anchor_pos, object_pos)
+
+        weights = (-distance / self.sigma).exp()
+        weights = l1norm(weights)
+
+        weights = inverse_pack(weights)
+
+        # aggregate
+
+        anchor_tokens = einsum(object_tokens, weights, 'b no n d, b no na n -> b no na d')
+
+        return anchor_tokens, anchor_pos
 
 # film
 
@@ -243,9 +294,16 @@ class Rigidformer(Module):
         axial_rope_kwargs: dict = dict(
             omega = 10_000
         ),
-        register_pos = -1000. # unsure what position to give the registers, so just make it far away
+        register_pos = -1000., # unsure what position to give the registers, so just make it far away
+        anchor_vertex_pool_kwargs: dict = dict(
+            learned_sigma = True
+        )
     ):
         super().__init__()
+
+        # embedding
+
+        self.anchor_vertex_pool = AnchorVertexPool(**anchor_vertex_pool_kwargs)
 
         # rotary embeddings
 
@@ -332,15 +390,23 @@ class Rigidformer(Module):
     def forward(
         self,
         object_tokens,           # (b no n d)
-        anchor_tokens,           # (b no na d)
         *,
         delta_times,             # (b)
         object_pos,              # (b no n 3)
-        anchor_pos,              # (b no na 3)
+        anchor_indices = None,   # (b no na)
+        anchor_tokens = None,    # (b no na d)
+        anchor_pos = None,       # (b no na 3)
         anchor_pos_prev = None,  # (b no na 3)
         anchor_pos_next = None   # (b no na 3)
     ):
         batch, max_num_objects = object_tokens.shape[:2]
+
+        # validate inputs
+
+        assert exists(anchor_indices) or (exists(anchor_tokens) and exists(anchor_pos))
+
+        if not exists(anchor_pos):
+            anchor_tokens, anchor_pos = self.anchor_vertex_pool(object_tokens, object_pos, anchor_indices)
 
         # time conditioning
 
