@@ -6,8 +6,8 @@ def test_rigidformer():
 
     import torch
 
-    object_tokens = torch.randn(2, 256, 512)
-    object_pos = torch.randn(2, 256, 3)
+    object_tokens = torch.randn(2, 2, 256, 512)
+    object_pos = torch.randn(2, 2, 256, 3)
 
     anchor_tokens = torch.randn(2, 2, 4, 512)
     anchor_pos = torch.randn(2, 2, 4, 3)
@@ -24,4 +24,5 @@ def test_rigidformer():
 
     pred = rigidformer(object_tokens, anchor_tokens, delta_times = delta_times, object_pos = object_pos, anchor_pos = anchor_pos, anchor_pos_prev = anchor_pos_prev)
 
-    assert pred.position.shape == (2, 2, 4, 3)
+    assert pred.anchor_next_positions.shape == (2, 2, 4, 3)
+    assert pred.object_next_positions.shape == (2, 2, 256, 3)

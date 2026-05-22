@@ -16,7 +16,7 @@ import roma
 
 # constants
 
-Predictions = namedtuple('Predictions', ('acceleration', 'position'))
+Predictions = namedtuple('Predictions', ('acceleration', 'anchor_next_positions', 'object_next_positions'))
 
 Losses = namedtuple('Losses', ('acceleration', 'position'))
 
@@ -331,16 +331,16 @@ class Rigidformer(Module):
 
     def forward(
         self,
-        object_tokens,           # (b no d)
+        object_tokens,           # (b no n d)
         anchor_tokens,           # (b no na d)
         *,
         delta_times,             # (b)
-        object_pos,              # (b no 3)
+        object_pos,              # (b no n 3)
         anchor_pos,              # (b no na 3)
         anchor_pos_prev = None,  # (b no na 3)
         anchor_pos_next = None   # (b no na 3)
     ):
-        batch = object_tokens.shape[0]
+        batch, max_num_objects = object_tokens.shape[:2]
 
         # time conditioning
 
@@ -350,15 +350,18 @@ class Rigidformer(Module):
 
         # register tokens
 
-        registers = repeat(self.register_tokens, 'no d -> b no d', b = batch)
+        registers = repeat(self.register_tokens, 'r d -> b no r d', b = batch, no = max_num_objects)
 
-        object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b * d')
+        object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b no * d')
+
+        object_tokens, inverse_pack_num_objects = pack_with_inverse(object_tokens, 'b * d')
 
         # object rotary embeddings
 
         object_rotary_pos_emb = self.rope_3d(object_pos)
-
         object_rotary_pos_emb_with_registers = pad_left_at_dim(object_rotary_pos_emb, self.num_register_tokens, dim = -2, value = self.register_pos)
+
+        object_rotary_pos_emb_with_registers, object_rotary_pos_emb = (rearrange(t, 'b h no na f -> b h (no na) f') for t in (object_rotary_pos_emb_with_registers, object_rotary_pos_emb))
 
         # handle the "ARoPE" - all anchors for the same object share the same mean pooled positional embedding, it seems
 
@@ -393,7 +396,9 @@ class Rigidformer(Module):
 
         for (attn_film, attn, ff_film, ff, attn_residual), object_context in zip(self.cross_attn_layers, object_contexts):
 
+            object_context = inverse_pack_num_objects(object_context)
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
+            object_context = rearrange(object_context, 'b na n d -> b (na n) d')
 
             filmed = attn_film(anchor_tokens, time_cond)
             anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context) + anchor_tokens
@@ -413,26 +418,27 @@ class Rigidformer(Module):
 
         pred = pred_acc
 
-        # calculate predicted next position if prerequisites are given (current and past position)
-
-        if exists(anchor_pos): # verlet - til
-            pred_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared)
-            pred = Predictions(pred_acc, pred_pos_next)
-
         # early return prediction if ground truth not passed in
 
         return_loss = exists(anchor_pos) and exists(anchor_pos_next)
 
+        # calculate predicted next position if not returning loss - kabsch and then return next anchors and object positions
+
+        pred_anchor_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared) # verlet
+
+        if not return_loss:
+
+            R, T = roma.rigid_points_registration(anchor_pos, pred_anchor_pos_next)
+
+            rigid_anchor_pos_next = einx.add('b no c, b no na c', T, einsum(anchor_pos, R, 'b no na c1, b no c2 c1 -> b no na c2'))
+            rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos, R, 'b no n c1, b no c2 c1 -> b no n c2'))
+
+            pred = Predictions(pred_acc, rigid_anchor_pos_next, rigid_object_pos_next)
+
         if not return_loss:
             return pred
 
-        max_num_objects = anchor_pos.shape[1]
-
-        delta_times_squared = repeat(delta_times_squared, 'b -> (b no) 1 1', no = max_num_objects)
-
-        # flatten batch and num objects into one dimension for kabsch
-
-        anchor_pos, anchor_pos_next, anchor_pos_prev, pred_acc, pred_pos_next = (rearrange(t, 'b no na p -> (b no) na p') for t in (anchor_pos, anchor_pos_next, anchor_pos_prev, pred_acc, pred_pos_next))
+        delta_times_squared = repeat(delta_times_squared, 'b -> b 1 1 1')
 
         # calculate loss with roma + kabsch
 
@@ -442,14 +448,14 @@ class Rigidformer(Module):
 
         R = roma.rigid_vectors_registration(pred_acc, anchor_acc)
 
-        pred_acc_rigid = einsum(pred_acc, R, 'b na c1, b c2 c1 -> b na c2')
+        pred_acc_rigid = einsum(pred_acc, R, 'b no na c1, b no c2 c1 -> b no na c2')
 
         # handle points
 
-        R, T = roma.rigid_points_registration(pred_pos_next, anchor_pos_next)
+        R, T = roma.rigid_points_registration(pred_anchor_pos_next, anchor_pos_next)
 
-        pred_pos_next_rotated = einsum(pred_pos_next, R, 'b na c1, b c2 c1 -> b na c2')
-        pred_pos_next_translated = einx.add('b na c, b c', pred_pos_next_rotated, T)
+        pred_pos_next_rotated = einsum(pred_anchor_pos_next, R, 'b no na c1, b no c2 c1 -> b no na c2')
+        pred_pos_next_translated = einx.add('b no na c, b no c', pred_pos_next_rotated, T)
 
         pred_pos_next_rigid = pred_pos_next_translated
 
@@ -458,7 +464,7 @@ class Rigidformer(Module):
         loss_fn = self.loss_fn
 
         acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
-        pos_loss = loss_fn(pred_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
+        pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
 
         total_loss = (
             acc_loss * self.acc_loss_weight +
