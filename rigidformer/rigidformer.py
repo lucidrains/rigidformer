@@ -8,8 +8,8 @@ from torch import nn, cat, stack, tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, Parameter
 
 import einx
-from einops import einsum, rearrange, repeat, pack
-from einops.layers.torch import Rearrange
+from einops import einsum, rearrange, repeat, pack, reduce
+from einops.layers.torch import Rearrange, Reduce
 
 from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim
 
@@ -38,11 +38,6 @@ def divisible_by(num, den):
 
 def l1norm(t):
     return F.normalize(t, dim = -1, p = 1)
-
-def mean_and_expand_back(t, dim):
-    shape = t.shape
-    t = t.mean(dim = dim, keepdim = True)
-    return t.expand(shape)
 
 # 3d axial rotary embeddings
 # the anchor rope mentioned is simply where they mean pool rotary embeddings for the 4 anchors, iiuc
@@ -299,9 +294,25 @@ class Rigidformer(Module):
         register_pos = -1000., # unsure what position to give the registers, so just make it far away
         anchor_vertex_pool_kwargs: dict = dict(
             learned_sigma = True
-        )
+        ),
+        vertex_properties_dim = 3,
+        hierarchical_encoder: Module | None = None
     ):
         super().__init__()
+
+        self.vertex_properties_dim = vertex_properties_dim
+
+        # vertex encoder
+
+        self.vertex_encoder = MLP(3 + 3 + vertex_properties_dim, dim * 2, dim)
+
+        if not exists(hierarchical_encoder):
+            hierarchical_encoder = nn.Sequential(
+                Reduce('b no n d -> b no d', 'mean'),
+                MLP(dim, dim * 2, dim)
+            )
+
+        self.hierarchical_encoder = hierarchical_encoder
 
         # embedding
 
@@ -393,26 +404,50 @@ class Rigidformer(Module):
 
     def forward(
         self,
-        object_tokens,           # (b no n d)
         *,
         delta_times,             # (b)
+        vertex_properties,       # (b no n d_attr) or (b no d_attr)
         object_pos,              # (b no n 3)
+        object_pos_prev = None,  # (b no n 3)
+        object_pos_next = None,  # (b no n 3)
+        object_first_frame_pos = None, # (b no n 3)
         anchor_indices = None,   # (b no na)
-        anchor_tokens = None,    # (b no na d)
-        anchor_pos = None,       # (b no na 3)
-        anchor_pos_prev = None,  # (b no na 3)
-        anchor_pos_next = None   # (b no na 3)
     ):
-        batch, max_num_objects = object_tokens.shape[:2]
+        batch, max_num_objects = object_pos.shape[:2]
 
         # validate inputs
 
-        assert exists(anchor_indices) or (exists(anchor_tokens) and exists(anchor_pos))
+        anchor_indices_spatial = repeat(anchor_indices, '... -> ... p', p = 3)
 
-        if not exists(anchor_pos):
-            pooled_object_tokens, anchor_pos = self.anchor_vertex_pool(object_tokens, object_pos, anchor_indices)
+        if exists(object_pos_prev):
+            anchor_pos_prev = object_pos_prev.gather(-2, anchor_indices_spatial)
 
-            anchor_tokens = self.pooled_object_to_anchor(pooled_object_tokens)
+        # construct vertex and object tokens
+
+        assert exists(object_pos_prev), 'object_pos_prev must be provided'
+
+        velocity = object_pos - object_pos_prev
+
+        if not exists(object_first_frame_pos):
+            object_first_frame_pos = torch.zeros_like(object_pos)
+
+        reference_offset = object_pos - object_first_frame_pos
+
+        assert exists(vertex_properties), 'vertex_properties must be passed in'
+
+        if vertex_properties.ndim == 3: # (b, no, d_attr)
+            vertex_properties = repeat(vertex_properties, 'b no d -> b no n d', n = object_pos.shape[-2])
+
+        vertex_features = torch.cat((velocity, reference_offset, vertex_properties), dim = -1)
+        vertex_tokens = self.vertex_encoder(vertex_features)
+
+        object_tokens = self.hierarchical_encoder(vertex_tokens)
+
+        # pool anchors
+
+        pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(vertex_tokens, object_pos, anchor_indices)
+
+        anchor_tokens = self.pooled_object_to_anchor(pooled_vertex_tokens)
 
         # time conditioning
 
@@ -422,24 +457,20 @@ class Rigidformer(Module):
 
         # register tokens
 
-        registers = repeat(self.register_tokens, 'r d -> b no r d', b = batch, no = max_num_objects)
+        registers = repeat(self.register_tokens, 'r d -> b r d', b = batch)
 
-        object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b no * d')
-
-        object_tokens, inverse_pack_num_objects = pack_with_inverse(object_tokens, 'b * d')
+        object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b * d')
 
         # object rotary embeddings
 
-        object_rotary_pos_emb = self.rope_3d(object_pos)
+        anchor_rope = self.rope_3d(anchor_pos)
+
+        object_rotary_pos_emb = reduce(anchor_rope, 'b h no na f -> b h no f', 'mean') # mean pooled anchor rotary embeddings
         object_rotary_pos_emb_with_registers = pad_left_at_dim(object_rotary_pos_emb, self.num_register_tokens, dim = -2, value = self.register_pos)
 
-        object_rotary_pos_emb_with_registers, object_rotary_pos_emb = (rearrange(t, 'b h no na f -> b h (no na) f') for t in (object_rotary_pos_emb_with_registers, object_rotary_pos_emb))
+        # handle the "ARoPE" for anchors
 
-        # handle the "ARoPE" - all anchors for the same object share the same mean pooled positional embedding, it seems
-
-        anchor_rotary_pos_emb = self.rope_3d(anchor_pos)
-        anchor_rotary_pos_emb = mean_and_expand_back(anchor_rotary_pos_emb, dim = -2) # (b no na f)
-        anchor_rotary_pos_emb = rearrange(anchor_rotary_pos_emb, 'b h no na f -> b h (no na) f')
+        anchor_rotary_pos_emb = rearrange(anchor_rope, 'b h no na f -> b h (no na) f')
 
         # object self attention
 
@@ -468,9 +499,7 @@ class Rigidformer(Module):
 
         for (attn_film, attn, ff_film, ff, attn_residual), object_context in zip(self.cross_attn_layers, object_contexts):
 
-            object_context = inverse_pack_num_objects(object_context)
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
-            object_context = rearrange(object_context, 'b na n d -> b (na n) d')
 
             filmed = attn_film(anchor_tokens, time_cond)
             anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context) + anchor_tokens
@@ -492,7 +521,10 @@ class Rigidformer(Module):
 
         # early return prediction if ground truth not passed in
 
-        return_loss = exists(anchor_pos) and exists(anchor_pos_next)
+        return_loss = exists(object_pos_next)
+
+        if return_loss:
+            anchor_pos_next = object_pos_next.gather(-2, anchor_indices_spatial)
 
         # calculate predicted next position if not returning loss - kabsch and then return next anchors and object positions
 

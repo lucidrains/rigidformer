@@ -3,37 +3,42 @@ import torch
 import pytest
 param = pytest.mark.parametrize
 
-@param('anchor_indices_given', (False, True))
-def test_rigidformer(
-    anchor_indices_given
-):
+def test_rigidformer():
     from rigidformer.rigidformer import Rigidformer
 
-
-    object_tokens = torch.randn(2, 2, 256, 512)
     object_pos = torch.randn(2, 2, 256, 3)
+    object_pos_prev = torch.randn(2, 2, 256, 3)
+    object_pos_next = torch.randn(2, 2, 256, 3)
+    vertex_properties = torch.randn(2, 2, 3)
 
-    if anchor_indices_given:
-        anchor_kwargs = dict(
-            anchor_indices = torch.randint(0, 256, (2, 2, 4))
-        )
-    else:
-        anchor_kwargs = dict(
-            anchor_tokens = torch.randn(2, 2, 4, 512),
-            anchor_pos = torch.randn(2, 2, 4, 3),
-        )
+    anchor_indices = torch.randint(0, 256, (2, 2, 4))
+
+    from einops.layers.torch import Reduce
 
     delta_times = torch.randn(2)
 
-    rigidformer = Rigidformer(512)
+    rigidformer = Rigidformer(
+        512,
+        hierarchical_encoder = Reduce('b no n d -> b no d', 'mean') # mock before building out pointnet++ and platonic transformer
+    )
 
-    anchor_pos_prev = torch.randn(2, 2, 4, 3)
-    anchor_pos_next = torch.randn(2, 2, 4, 3)
-
-    loss, loss_breakdown = rigidformer(object_tokens, delta_times = delta_times, object_pos = object_pos, anchor_pos_prev = anchor_pos_prev, anchor_pos_next = anchor_pos_next, **anchor_kwargs)
+    loss, loss_breakdown = rigidformer(
+        delta_times = delta_times,
+        vertex_properties = vertex_properties,
+        object_pos = object_pos,
+        object_pos_prev = object_pos_prev,
+        object_pos_next = object_pos_next,
+        anchor_indices = anchor_indices
+    )
     loss.backward()
 
-    pred = rigidformer(object_tokens, delta_times = delta_times, object_pos = object_pos, anchor_pos_prev = anchor_pos_prev, **anchor_kwargs)
+    pred = rigidformer(
+        delta_times = delta_times,
+        vertex_properties = vertex_properties,
+        object_pos = object_pos,
+        object_pos_prev = object_pos_prev,
+        anchor_indices = anchor_indices
+    )
 
     assert pred.anchor_next_positions.shape == (2, 2, 4, 3)
     assert pred.object_next_positions.shape == (2, 2, 256, 3)
