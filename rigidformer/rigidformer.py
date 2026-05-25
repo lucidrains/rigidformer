@@ -194,13 +194,19 @@ class AttentionResidualPool(Module):
     def __init__(
         self,
         dim,
-        dim_head = 16
+        dim_head = 16,
+        learned_pooling = False
     ):
         super().__init__()
         assert divisible_by(dim, dim_head)
         heads = dim // dim_head
         self.scale = dim_head ** -0.5
-        self.queries = nn.Parameter(torch.randn(dim) * 1e-2)
+
+        self.learned_pooling = learned_pooling
+        if learned_pooling:
+            self.to_learned_queries = Linear(dim, dim, bias = False)
+        else:
+            self.queries = nn.Parameter(torch.randn(dim) * 1e-2)
 
         self.key_rmsnorm = nn.RMSNorm(dim)
 
@@ -217,7 +223,14 @@ class AttentionResidualPool(Module):
 
         # queries, keys, values
 
-        q, k, v = self.queries, self.key_rmsnorm(layer_hiddens), layer_hiddens
+        if self.learned_pooling:
+            q = self.to_learned_queries(last(hiddens))
+            q_einsum = 'b n h d, b n l h d -> b n h l'
+        else:
+            q = self.queries
+            q_einsum = 'h d, b n l h d -> b n h l'
+
+        k, v = self.key_rmsnorm(layer_hiddens), layer_hiddens
 
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
@@ -225,7 +238,7 @@ class AttentionResidualPool(Module):
 
         # attention
 
-        sim = einsum(q, k, 'h d, b n l h d -> b n h l')
+        sim = einsum(q, k, q_einsum)
 
         attn = sim.sigmoid()
 
@@ -340,6 +353,8 @@ class Rigidformer(Module):
         anchor_cross_attn_depth = 4,
         num_anchors = 4,
         object_hidden_layers: tuple[int, ...] = (0, 1, 2, 4),  # the hidden object layer outputs that the anchor decoder cross attends to
+        learned_object_hidden_layers = False, # learned pooling à la attention residuals
+        attn_residual_learned_pooling = False,
         pos_loss_weight = 10.,
         acc_loss_weight = 1.,
         axial_rope_kwargs: dict = dict(
@@ -401,7 +416,7 @@ class Rigidformer(Module):
             attn_film = FiLM(dim, 2)
             ff_film = FiLM(dim, 2)
 
-            attn_residual = AttentionResidualPool(dim) if not is_last else None
+            attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if not is_last else None
 
             layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
 
@@ -414,9 +429,13 @@ class Rigidformer(Module):
 
         self.num_anchors = num_anchors # if anchor_indices not passed in, will do naive fps
 
-        assert object_self_attn_depth in object_hidden_layers, '`object_hidden_layers` should attend to the output of the object transformer ({object_self_attn_depth})'
-        assert all([0 <= l <= object_self_attn_depth for l in object_hidden_layers])
-        assert len(object_hidden_layers) == anchor_cross_attn_depth, 'length of `object_hidden_layers` must be equal to the depth of the anchor cross attention transformer'
+        self.learned_object_hidden_layers = learned_object_hidden_layers
+        self.object_hidden_layers = object_hidden_layers
+
+        if not learned_object_hidden_layers:
+            assert object_self_attn_depth in object_hidden_layers, f'`object_hidden_layers` should attend to the output of the object transformer ({object_self_attn_depth})'
+            assert all([0 <= l <= object_self_attn_depth for l in object_hidden_layers])
+            assert len(object_hidden_layers) == anchor_cross_attn_depth, 'length of `object_hidden_layers` must be equal to the depth of the anchor cross attention transformer'
 
         layers = ModuleList([])
 
@@ -436,13 +455,12 @@ class Rigidformer(Module):
             attn_film = FiLM(dim, 2)
             ff_film = FiLM(dim, 2)
 
-            attn_residual = AttentionResidualPool(dim)
+            attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling)
+            context_attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if learned_object_hidden_layers else None
 
-            layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
+            layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual, context_attn_residual]))
 
         self.cross_attn_layers = layers
-
-        self.object_hidden_layers = object_hidden_layers
 
         self.to_acc_pred = nn.Sequential(
             nn.RMSNorm(dim),
@@ -556,9 +574,13 @@ class Rigidformer(Module):
 
         anchor_hiddens = [anchor_tokens]
 
-        object_contexts = [object_hiddens[layer] for layer in self.object_hidden_layers] # gather all the object self attention hidden layers for cross attending
+        for ind, (attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
 
-        for (attn_film, attn, ff_film, ff, attn_residual), object_context in zip(self.cross_attn_layers, object_contexts):
+            if self.learned_object_hidden_layers:
+                object_context = context_attn_residual(object_hiddens)
+            else:
+                object_layer_index = self.object_hidden_layers[ind]
+                object_context = object_hiddens[object_layer_index]
 
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
 

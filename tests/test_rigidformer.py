@@ -5,9 +5,11 @@ param = pytest.mark.parametrize
 
 @param('fps', (False, True))
 @param('test_rand_steps', (False, True))
+@param('attn_residual_learned_pooling', (False, True))
 def test_rigidformer(
     fps,
-    test_rand_steps
+    test_rand_steps,
+    attn_residual_learned_pooling
 ):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper
 
@@ -24,7 +26,8 @@ def test_rigidformer(
 
     rigidformer = Rigidformer(
         512,
-        hierarchical_encoder = Reduce('b no n d -> b no d', 'mean') # mock before building out pointnet++ and platonic transformer
+        hierarchical_encoder = Reduce('b no n d -> b no d', 'mean'), # mock before building out pointnet++ and platonic transformer
+        attn_residual_learned_pooling = attn_residual_learned_pooling
     )
 
     kwargs = dict()
