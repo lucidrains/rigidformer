@@ -11,7 +11,7 @@ def test_rigidformer(
     test_rand_steps,
     attn_residual_learned_pooling
 ):
-    from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper
+    from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper, PointNet
 
     object_pos = torch.randn(2, 2, 256, 3)
     object_pos_prev = torch.randn(2, 2, 256, 3)
@@ -20,13 +20,11 @@ def test_rigidformer(
 
     anchor_indices = torch.randint(0, 256, (2, 2, 4))
 
-    from einops.layers.torch import Reduce
-
     delta_times = torch.randn(2)
 
     rigidformer = Rigidformer(
         512,
-        hierarchical_encoder = Reduce('b no n d -> b no d', 'mean'), # mock before building out pointnet++ and platonic transformer
+        hierarchical_encoder = PointNet(dim = 512, dim_out = 512),
         attn_residual_learned_pooling = attn_residual_learned_pooling
     )
 
@@ -74,3 +72,14 @@ def test_rigidformer(
     last_position = object_positions[-1]
 
     assert last_position.shape == (2, 2, 256, 3)
+
+def test_pointnet():
+    from rigidformer.rigidformer import PointNet
+
+    features = torch.randn(2, 2, 256, 64)
+    pos = torch.randn(2, 2, 256, 3)
+
+    net = PointNet(dim = 64, dim_out = 128)
+    out = net(features, pos)
+
+    assert out.shape == (2, 2, 128)

@@ -82,6 +82,120 @@ def naive_farthest_point_sample(
 
     return inverse_pack(sampled, '* na')
 
+# pointnet++
+
+class PointNetSetAbstract(Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_out,
+        num_points,
+        num_samples,
+        mlp_hidden_dim = None
+    ):
+        super().__init__()
+        self.num_points = num_points
+        self.num_samples = num_samples
+
+        mlp_hidden_dim = default(mlp_hidden_dim, dim_out)
+
+        self.mlp = MLP(dim + 3, dim_out, mlp_hidden_dim)
+
+    def forward(
+        self,
+        features, # (... n d)
+        pos,      # (... n 3)
+    ):
+        pos, inverse_pack_pos = pack_with_inverse(pos, '* n p')
+        features, inverse_pack_features = pack_with_inverse(features, '* n d')
+
+        batch, n, _ = pos.shape
+        _, _, dim = features.shape
+
+        # global pool
+
+        if not exists(self.num_points) or self.num_points >= n:
+            new_pos = reduce(pos, 'b n p -> b 1 p', 'mean')
+
+            grouped_pos = einx.subtract('b n p, b 1 p -> b 1 n p', pos, new_pos)
+            grouped_features = repeat(features, 'b n d -> b 1 n d')
+
+            grouped_features = cat((grouped_pos, grouped_features), dim = -1)
+
+            new_features = self.mlp(grouped_features)
+            new_features = reduce(new_features, 'b 1 n d -> b 1 d', 'max')
+
+            return inverse_pack_features(new_features, '* n d'), inverse_pack_pos(new_pos, '* n p')
+
+        # fps
+
+        sampled_indices = naive_farthest_point_sample(pos, self.num_points)
+
+        new_pos = pos.gather(1, repeat(sampled_indices, 'b n -> b n p', p = 3))
+
+        # knn
+
+        dist = torch.cdist(new_pos, pos)
+        _, knn_indices = dist.topk(self.num_samples, dim = -1, largest = False)
+
+        grouped_pos = pos.gather(1, repeat(knn_indices, 'b m k -> b (m k) p', p = 3))
+        grouped_pos = rearrange(grouped_pos, 'b (m k) p -> b m k p', m = self.num_points)
+        grouped_pos = einx.subtract('b m k p, b m p -> b m k p', grouped_pos, new_pos)
+
+        grouped_features = features.gather(1, repeat(knn_indices, 'b m k -> b (m k) d', d = dim))
+        grouped_features = rearrange(grouped_features, 'b (m k) d -> b m k d', m = self.num_points)
+
+        grouped_features = cat((grouped_pos, grouped_features), dim = -1)
+
+        new_features = self.mlp(grouped_features)
+        new_features = reduce(new_features, 'b m k d -> b m d', 'max')
+
+        return inverse_pack_features(new_features, '* n d'), inverse_pack_pos(new_pos, '* n p')
+
+class PointNet(Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_out,
+        num_points: tuple[int | None, ...] = (128, 32, None),
+        num_samples: tuple[int | None, ...] = (32, 16, None),
+        expansion_factor: int = 2
+    ):
+        super().__init__()
+        assert len(num_points) == len(num_samples)
+
+        self.layers = ModuleList([])
+
+        num_layers = len(num_points)
+        dim_in = dim
+
+        for ind, (layer_num_points, layer_num_samples) in enumerate(zip(num_points, num_samples)):
+            is_last = ind == (num_layers - 1)
+
+            dim_out_layer = dim_out if is_last else int(dim_in * expansion_factor)
+
+            self.layers.append(PointNetSetAbstract(
+                dim = dim_in,
+                dim_out = dim_out_layer,
+                num_points = layer_num_points,
+                num_samples = layer_num_samples
+            ))
+
+            dim_in = dim_out_layer
+
+    def forward(
+        self,
+        features,  # (... n d)
+        pos        # (... n 3)
+    ):
+        for layer in self.layers:
+            features, pos = layer(features, pos)
+
+        features = rearrange(features, '... 1 d -> ... d')
+        return features
+
 # 3d axial rotary embeddings
 # the anchor rope mentioned is simply where they mean pool rotary embeddings for the 4 anchors, iiuc
 
@@ -520,7 +634,9 @@ class Rigidformer(Module):
         vertex_features = torch.cat((velocity, reference_offset, vertex_properties), dim = -1)
         vertex_tokens = self.vertex_encoder(vertex_features)
 
-        object_tokens = self.hierarchical_encoder(vertex_tokens)
+        # hierarchical encoder - pointnet++ or custom
+
+        object_tokens = self.hierarchical_encoder(vertex_tokens, object_pos)
 
         # pool anchors
 
