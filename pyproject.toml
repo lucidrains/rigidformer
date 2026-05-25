@@ -1,6 +1,6 @@
 [project]
 name = "rigidformer"
-version = "0.0.14"
+version = "0.0.15"
 description = "Implementation of Rigidformer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

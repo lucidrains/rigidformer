@@ -4,8 +4,10 @@ import pytest
 param = pytest.mark.parametrize
 
 @param('fps', (False, True))
+@param('test_rand_steps', (False, True))
 def test_rigidformer(
-    fps
+    fps,
+    test_rand_steps
 ):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper
 
@@ -42,9 +44,23 @@ def test_rigidformer(
 
     rollout_wrapper = RigidformerRolloutWrapper(rigidformer)
 
+    if test_rand_steps:
+        delta_times_input = rollout_wrapper.rand_steps(
+            delta_times = delta_times,
+            num_rand_substeps = 4,
+            max_step_weight = 3
+        )
+        assert delta_times_input.shape == (2, 4)
+        assert torch.allclose(delta_times_input.sum(dim = -1), delta_times)
+
+        num_steps = None
+    else:
+        delta_times_input = delta_times
+        num_steps = 4
+
     object_positions = rollout_wrapper(
-        num_steps = 4,
-        delta_times = delta_times,
+        delta_times = delta_times_input,
+        num_steps = num_steps,
         vertex_properties = vertex_properties,
         object_positions = [object_pos_prev, object_pos],
         **kwargs

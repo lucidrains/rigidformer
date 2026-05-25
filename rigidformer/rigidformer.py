@@ -638,15 +638,43 @@ class RigidformerRolloutWrapper(Module):
 
         self.rigidformer = rigidformer
 
+    def rand_steps(
+        self,
+        delta_times, # (b)
+        *,
+        num_rand_substeps,
+        max_step_weight = 2
+    ):
+        batch, device = delta_times.shape[0], delta_times.device
+
+        # returns times broken up into random substeps, for consistency training
+
+        rand_step_weights = torch.randint(1, max_step_weight, (batch, num_rand_substeps), device = device)
+
+        return einx.multiply('b n, b', l1norm(rand_step_weights.float()), delta_times)
+
     def forward(
         self,
-        num_steps,
-        delta_times: Tensor, # (b)
+        delta_times, # (b) | (b steps)
         *,
         vertex_properties,              # (b no n d_attr) or (b no d_attr)
         object_positions: list[Tensor], # must be at least 2
+        num_steps = None,
         anchor_indices = None,          # (b no na)
     ):
+
+        # either fixed delta times for num steps
+        # or one can specify variable delta times
+
+        assert (
+            (exists(num_steps) and delta_times.ndim == 1) or
+            (not exists(num_steps) and delta_times.ndim == 2)
+        )
+
+        if delta_times.ndim == 1:
+            delta_times = repeat(delta_times, 'b -> b steps', steps = num_steps)
+
+        # validate the object initial positions and make a shallow copy
 
         assert len(object_positions) >= 2, 'object position history must be at least 2'
         object_positions = object_positions.copy()
@@ -657,13 +685,13 @@ class RigidformerRolloutWrapper(Module):
 
         # iterate through steps at delta steps - todo: make delta_times customizable
 
-        for _ in range(num_steps):
+        for one_delta_time in delta_times.unbind(dim = -1):
 
             *_, object_pos_prev, object_pos = object_positions
 
             one_step_pred = self.rigidformer(
+                delta_times = one_delta_time,
                 object_pos = object_pos,
-                delta_times = delta_times,
                 object_pos_prev = object_pos_prev,
                 object_first_frame_pos = object_first_frame_pos,
                 vertex_properties = vertex_properties,
