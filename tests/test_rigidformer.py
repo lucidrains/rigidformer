@@ -8,12 +8,14 @@ param = pytest.mark.parametrize
 @param('attn_residual_learned_pooling', (False, True))
 @param('variable_object_lens', (False, True))
 @param('variable_point_lens', (False, True))
+@param('anchor_self_attn', (False, True))
 def test_rigidformer(
     fps,
     test_rand_steps,
     attn_residual_learned_pooling,
     variable_object_lens,
-    variable_point_lens
+    variable_point_lens,
+    anchor_self_attn
 ):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper, PointNet
 
@@ -29,7 +31,8 @@ def test_rigidformer(
     rigidformer = Rigidformer(
         512,
         hierarchical_encoder = PointNet(dim = 512, dim_out = 512),
-        attn_residual_learned_pooling = attn_residual_learned_pooling
+        attn_residual_learned_pooling = attn_residual_learned_pooling,
+        anchor_self_attn = anchor_self_attn
     )
 
     kwargs = dict()

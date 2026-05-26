@@ -551,6 +551,7 @@ class Rigidformer(Module):
         num_register_tokens = 16,
         object_self_attn_depth = 4,
         anchor_cross_attn_depth = 4,
+        anchor_self_attn = False,
         num_anchors = 4,
         object_hidden_layers: tuple[int, ...] = (0, 1, 2, 4),  # the hidden object layer outputs that the anchor decoder cross attends to
         learned_object_hidden_layers = False, # learned pooling à la attention residuals
@@ -638,6 +639,9 @@ class Rigidformer(Module):
 
         for _ in range(anchor_cross_attn_depth):
 
+            self_attn_film = FiLM(dim, 2) if anchor_self_attn else None
+            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads) if anchor_self_attn else None
+
             attn = Attention(
                 dim = dim,
                 dim_head = dim_head,
@@ -655,7 +659,7 @@ class Rigidformer(Module):
             attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling)
             context_attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if learned_object_hidden_layers else None
 
-            layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual, context_attn_residual]))
+            layers.append(ModuleList([self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual]))
 
         self.cross_attn_layers = layers
 
@@ -794,7 +798,13 @@ class Rigidformer(Module):
 
         anchor_hiddens = [anchor_tokens]
 
-        for ind, (attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
+        anchor_mask = repeat(object_mask, 'b no -> b (no na)', na = self.num_anchors) if exists(object_mask) else None
+
+        for ind, (self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
+
+            if exists(self_attn):
+                filmed_self = self_attn_film(anchor_tokens, time_cond)
+                anchor_tokens = self_attn(filmed_self, rotary_pos_emb = anchor_rotary_pos_emb, mask = anchor_mask) + anchor_tokens
 
             if self.learned_object_hidden_layers:
                 object_context = context_attn_residual(object_hiddens)
