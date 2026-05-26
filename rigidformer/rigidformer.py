@@ -11,7 +11,7 @@ import einx
 from einops import einsum, rearrange, repeat, pack, reduce
 from einops.layers.torch import Rearrange, Reduce
 
-from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim, lens_to_mask, masked_mean
+from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim, lens_to_mask, masked_mean, pad_right_ndim_to_and_expand_as
 
 from x_mlps_pytorch import MLP
 
@@ -91,7 +91,8 @@ def nearest_neighbor_displacement(
 
     # get object displacement (clamp idx to safely avoid out of bounds if ground is nearest)
 
-    safe_idx = repeat(other_idx.clamp(max = total_points - 1), 'b no n -> b (no n) p', p = 3)
+    safe_idx = rearrange(other_idx.clamp(max = total_points - 1), 'b no n -> b (no n)')
+    safe_idx = pad_right_ndim_to_and_expand_as(safe_idx, all_pos)
     other_pos = all_pos.gather(1, safe_idx)
     other_disp = rearrange(other_pos, 'b (no n) p -> b no n p', no = num_objects) - object_pos
 
@@ -131,7 +132,7 @@ def naive_farthest_point_sample(
         is_first = i == 0
         next_i = i + 1
 
-        last_sampled_indices = repeat(sampled[:, i:next_i], '... -> ... d', d = d)
+        last_sampled_indices = pad_right_ndim_to_and_expand_as(sampled[:, i:next_i], positions)
         last_pos = positions.gather(-2, last_sampled_indices)
 
         next_distance = cdist(last_pos, positions)[:, 0]
@@ -205,18 +206,20 @@ class PointNetSetAbstract(Module):
 
         sampled_indices = naive_farthest_point_sample(pos, self.num_points, mask = mask)
 
-        new_pos = pos.gather(1, repeat(sampled_indices, 'b n -> b n p', p = 3))
+        new_pos = pos.gather(1, pad_right_ndim_to_and_expand_as(sampled_indices, pos))
 
         # knn
 
         dist = cdist(new_pos, pos)
         _, knn_indices = dist.topk(self.num_samples, dim = -1, largest = False)
 
-        grouped_pos = pos.gather(1, repeat(knn_indices, 'b m k -> b (m k) p', p = 3))
+        knn_indices_packed = rearrange(knn_indices, 'b m k -> b (m k)')
+
+        grouped_pos = pos.gather(1, pad_right_ndim_to_and_expand_as(knn_indices_packed, pos))
         grouped_pos = rearrange(grouped_pos, 'b (m k) p -> b m k p', m = self.num_points)
         grouped_pos = einx.subtract('b m k p, b m p -> b m k p', grouped_pos, new_pos)
 
-        grouped_features = features.gather(1, repeat(knn_indices, 'b m k -> b (m k) d', d = dim))
+        grouped_features = features.gather(1, pad_right_ndim_to_and_expand_as(knn_indices_packed, features))
         grouped_features = rearrange(grouped_features, 'b (m k) d -> b m k d', m = self.num_points)
 
         grouped_features = cat((grouped_pos, grouped_features), dim = -1)
@@ -333,7 +336,7 @@ class AnchorVertexPool(Module):
         mask = None     # (b no n)
     ):
 
-        anchor_indices = repeat(anchor_indices, '... -> ... p', p = 3)
+        anchor_indices = pad_right_ndim_to_and_expand_as(anchor_indices, object_pos)
         anchor_pos = object_pos.gather(-2, anchor_indices)
 
         object_pos, inverse_pack = pack_with_inverse(object_pos, '* n p')
@@ -703,7 +706,7 @@ class Rigidformer(Module):
 
         # validate inputs
 
-        anchor_indices_spatial = repeat(anchor_indices, '... -> ... p', p = 3)
+        anchor_indices_spatial = pad_right_ndim_to_and_expand_as(anchor_indices, object_pos)
 
         if exists(object_pos_prev):
             anchor_pos_prev = object_pos_prev.gather(-2, anchor_indices_spatial)
