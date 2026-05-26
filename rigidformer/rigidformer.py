@@ -325,7 +325,7 @@ class FiLM(Module):
 
         gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
 
-        scaled = einx.add('b n d, b d', normed, gamma + 1.)
+        scaled = einx.multiply('b n d, b d', normed, gamma + 1.)
         return einx.add('b n d, b d', scaled, beta)
 
 # attention residual pooler
